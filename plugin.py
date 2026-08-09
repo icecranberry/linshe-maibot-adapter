@@ -21,6 +21,7 @@ from copy import deepcopy
 from html import unescape
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import asyncio
 import base64
@@ -58,7 +59,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件（默认开启，无需手动开关）", json_schema_extra={"hidden": True})
-    config_version: str = Field(default="1.2.1", description="配置版本", json_schema_extra={"hidden": True})
+    config_version: str = Field(default="1.2.2", description="配置版本", json_schema_extra={"hidden": True})
 
 
 class BridgeSectionConfig(PluginConfigBase):
@@ -178,6 +179,27 @@ class NeighborBridgePlugin(MaiBotPlugin):
             }
         schema["layout"] = {"type": "auto", "tabs": []}
         return schema
+
+    def get_components(self) -> list[dict[str, Any]]:
+        """收集组件声明，并让管理页链接跟随 bridge.base_url 配置。"""
+        components = super().get_components()
+        base_url = str(self.config.bridge.base_url or "http://127.0.0.1:3099").strip().rstrip("/")
+        management_url = f"{base_url}/api/maibot/plugin-ui"
+        for component in components:
+            if str(component.get("name") or "") != "persona_manager":
+                continue
+            metadata = component.get("metadata")
+            if isinstance(metadata, dict):
+                content = metadata.get("content")
+                if isinstance(content, list):
+                    for block in content:
+                        if not isinstance(block, dict) or block.get("type") != "actions":
+                            continue
+                        for action in block.get("actions") or []:
+                            if isinstance(action, dict) and str(action.get("label") or "") == "打开人格管理页":
+                                action["url"] = management_url
+            break
+        return components
 
     def __init__(self) -> None:
         """初始化插件状态。"""
@@ -379,7 +401,9 @@ class NeighborBridgePlugin(MaiBotPlugin):
         if self._http_client is None:
             self._http_client = httpx.AsyncClient(timeout=30)
         base_url = str(self.config.bridge.base_url or "").rstrip("/")
-        response = await self._http_client.request(method, f"{base_url}{path}", **kwargs)
+        parsed = urlparse(path)
+        request_url = path if parsed.scheme in {"http", "https"} else f"{base_url}{path}"
+        response = await self._http_client.request(method, request_url, **kwargs)
         response.raise_for_status()
         return response
 

@@ -106,7 +106,7 @@ flowchart LR
 | 配置项 | 说明 |
 | --- | --- |
 | `plugin.enabled` | 是否启用 |
-| `plugin.config_version` | 配置版本（当前 `1.2.1`） |
+| `plugin.config_version` | 配置版本（当前 `1.2.2`） |
 | `bridge.base_url` | 邻舍服务地址，默认 `http://127.0.0.1:3099` |
 | `bridge.character_name` | 邻舍角色名（`characters.name`）；留空跳过全部流程 |
 | `persona` | 已无字段（1.2.0 起人格数据全部走本地 `persona_store.json`） |
@@ -126,4 +126,4 @@ MaiBot 会在加载/热更新时自动规范化 `config.toml` 并在 `config_bac
 
 ## 9. 版本
 
-当前版本 `1.2.1`，变更记录见 [CHANGELOG.md](./CHANGELOG.md)。1.2.1 核心变化：人格数据由插件 API 管理并写入 SDK 标准持久化目录，邻舍管理页不再直接访问 MaiBot 文件系统。
+当前版本 `1.2.2`，变更记录见 [CHANGELOG.md](./CHANGELOG.md)。1.2.2 修复：管理页链接跟随 `bridge.base_url`，图片下载兼容绝对 URL，并更新 Host 兼容上限至 `1.1.4`。
