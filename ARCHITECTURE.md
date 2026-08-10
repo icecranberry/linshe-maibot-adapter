@@ -6,7 +6,7 @@
 
 | 能力 | 触发点 | 说明 |
 | --- | --- | --- |
-| 人格注入 | `before_model_request` | 把 system 人格整条替换为所选角色的 `base_prompt`，并将「行为风格 / 表达风格」作为请求指令注入，覆盖 MaiBot 设置里的同名配置 |
+| 人格注入 | `before_model_request` / `planner.before_request` | replyer 把 system 人格整条替换为所选角色的 `base_prompt`，Planner 把默认行为风格替换为邻舍风格；「行为风格 / 表达风格」作为请求指令注入，并移除 MaiBot 自带表达习惯 |
 | 记忆落库 | `reply_before_post_process`（不阻塞） | 本轮对话交给邻舍 `/api/maibot/chat` 落库长期记忆 + 滚动摘要；可把邻舍整理好的记忆摘要注入主聊天流（每 40 句真实内容一份） |
 | 按需配图 | 同上 | 由邻舍判断是否需要配图，需要时异步生图，插件轮询任务状态，完成后以图片消息发出 |
 | 人格管理页 | WebUI 首页 HomeCard | 跳转到邻舍托管的管理页，查看/编辑注入的 `base_prompt` 与风格 |
@@ -33,7 +33,7 @@
 ```mermaid
 flowchart LR
     U[用户消息] --> M[Maisaka 构造请求]
-    M -->|before_model_request| P[插件: 替换 system 为 base_prompt + 注入风格]
+    M -->|planner.before_request / before_model_request| P[插件: 替换默认人格/行为风格 + 注入风格]
     P --> L[LLM 生成回复]
     L -->|reply_before_post_process 不阻塞| B[插件异步调邻舍 /chat]
     B --> D[(邻舍数据库: 记忆/会话)]
@@ -106,7 +106,7 @@ flowchart LR
 | 配置项 | 说明 |
 | --- | --- |
 | `plugin.enabled` | 是否启用 |
-| `plugin.config_version` | 配置版本（当前 `1.2.2`） |
+| `plugin.config_version` | 配置版本（当前 `1.2.3`） |
 | `bridge.base_url` | 邻舍服务地址，默认 `http://127.0.0.1:3099` |
 | `bridge.character_name` | 邻舍角色名（`characters.name`）；留空跳过全部流程 |
 | `persona` | 已无字段（1.2.0 起人格数据全部走本地 `persona_store.json`） |
@@ -126,4 +126,4 @@ MaiBot 会在加载/热更新时自动规范化 `config.toml` 并在 `config_bac
 
 ## 9. 版本
 
-当前版本 `1.2.2`，变更记录见 [CHANGELOG.md](./CHANGELOG.md)。1.2.2 修复：管理页链接跟随 `bridge.base_url`，图片下载兼容绝对 URL，并更新 Host 兼容上限至 `1.1.4`。
+当前版本 `1.2.3`，变更记录见 [CHANGELOG.md](./CHANGELOG.md)。1.2.3 新增 Planner 行为风格覆盖，并移除 replyer 中的 MaiBot 自带表达习惯。

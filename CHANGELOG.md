@@ -1,5 +1,10 @@
 # 更新日志
 
+## 1.2.3
+
+- 修复：新增 `maisaka.planner.before_request` 注入，Planner 不再沿用 MaiBot 默认行为风格。
+- 修复：replyer 注入时移除 MaiBot 自带的表达习惯与一次性回复风格，邻舍表达风格完全接管。
+
 ## 1.2.2
 
 - 修复：首页人格管理卡片链接改为跟随 `bridge.base_url`，不再硬编码 `127.0.0.1:3099`。

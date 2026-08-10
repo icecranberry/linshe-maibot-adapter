@@ -2,8 +2,9 @@
 
 能力说明：
 1. 人格注入：在 Maisaka 回复器构造完模型请求后（maisaka.replyer.before_model_request），
-   将 system 人格整条替换为邻舍角色的 base_prompt，并调用邻舍 /api/maibot/derive-style
-   始终提炼行为风格与表达风格，以 user 消息注入请求。
+   将 system 人格整条替换为邻舍角色的 base_prompt；在 Planner 请求前
+   （maisaka.planner.before_request）覆盖默认行为风格。行为/表达风格由邻舍
+   /api/maibot/derive-style 提炼并以 user 消息注入请求，同时移除 MaiBot 自带表达习惯。
 2. 记忆与配图：MaiBot 生成最终回复后（maisaka.reply.before_post_process），将本轮对话交给
    邻舍 /api/maibot/chat 落库记忆并判断是否需要配图；需要配图时轮询 /api/maibot/tasks/:id，
    拿到图片后由 MaiBot 以图片消息发出。
@@ -35,6 +36,13 @@ from maibot_sdk import API, Field, HomeCard, HookHandler, MaiBotPlugin, PluginCo
 from maibot_sdk.types import ErrorPolicy
 
 CHARACTERS_CACHE_TTL_SEC = 300.0
+HTTP_TIMEOUT_SEC = 120.0
+
+_BEHAVIOR_STYLE_BLOCK_RE = re.compile(
+    r"(?ms)(^[^\n]*?(?:的行为风格|'s behavior style|の行動スタイル)\s*[:：]).*?(?=\n\s*\n)"
+)
+_EXPRESSION_HABITS_MARKER = "【表达习惯参考，请视情况自然的使用】"
+_TEMPORARY_REPLY_STYLE_MARKER = "你的说话风格可以尝试："
 
 _MSG_TAG_RE = re.compile(r"^<message\b[^>]*>$")
 _SPEAKER_TAG_RE = re.compile(r'<message\b[^>]*\buser="([^"]*)"')
@@ -59,7 +67,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件（默认开启，无需手动开关）", json_schema_extra={"hidden": True})
-    config_version: str = Field(default="1.2.2", description="配置版本", json_schema_extra={"hidden": True})
+    config_version: str = Field(default="1.2.3", description="配置版本", json_schema_extra={"hidden": True})
 
 
 class BridgeSectionConfig(PluginConfigBase):
@@ -214,7 +222,7 @@ class NeighborBridgePlugin(MaiBotPlugin):
 
     async def on_load(self) -> None:
         """插件加载：创建 HTTP 客户端并加载本地人格数据。"""
-        self._http_client = httpx.AsyncClient(timeout=30)
+        self._http_client = httpx.AsyncClient(timeout=HTTP_TIMEOUT_SEC)
         await self._load_persona_store()
         self._get_logger().info("邻舍桥接：插件已加载")
 
@@ -303,26 +311,17 @@ class NeighborBridgePlugin(MaiBotPlugin):
             return None
         if not str(self.config.bridge.character_name or "").strip():
             return None
-        character = await self._get_character()
-        if not character:
+        persona_bundle = await self._load_persona_bundle()
+        if persona_bundle is None:
             return None
-        character_name = str(character.get("name") or "").strip()
-        store_entry = await self._get_or_create_store_entry(character_name)
-
-        # base_prompt 优先使用本地副本（用户可在管理页修改），首次拉取邻舍原文后保存副本
-        base_prompt = str(store_entry.get("base_prompt") or "").strip()
-        if not base_prompt:
-            base_prompt = str(character.get("base_prompt") or "").strip()
-            if base_prompt:
-                store_entry["base_prompt"] = base_prompt
-                await self._save_persona_store()
-        if not base_prompt:
-            return None
+        base_prompt, styles = persona_bundle
 
         new_messages = deepcopy(messages)
+        original_message_count = len(new_messages)
+        new_messages = self._remove_maibot_style_messages(new_messages)
+        removed_maibot_styles = original_message_count - len(new_messages)
         self._replace_system_prompt(new_messages, base_prompt)
         injected_styles: list[str] = []
-        styles = await self._resolve_styles(base_prompt, store_entry)
         style_messages: list[dict[str, str]] = []
         behavior_style = styles.get("behavior_style")
         if behavior_style:
@@ -344,9 +343,39 @@ class NeighborBridgePlugin(MaiBotPlugin):
             new_messages[-1:-1] = [{"role": "user", "content": f"<latest_memory>\n{memory_content}\n</latest_memory>"}]
         self._get_logger().info(
             f"邻舍桥接：已注入人格 character={self.config.bridge.character_name} "
-            f"system_replaced=True styles={injected_styles} memory_injected={bool(memory_content)}"
+            f"system_replaced=True styles={injected_styles} "
+            f"maibot_styles_removed={removed_maibot_styles} memory_injected={bool(memory_content)}"
         )
         return {"action": "continue", "modified_kwargs": {"messages": new_messages}}
+
+    # ===== 行为风格覆盖：maisaka.planner.before_request =====
+
+    @HookHandler(
+        "maisaka.planner.before_request",
+        name="neighbor_planner_persona_inject",
+        description="将 Planner 系统提示中的 MaiBot 默认行为风格替换为邻舍行为风格",
+        timeout_ms=20000,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def handle_planner_before_request(self, **kwargs: Any) -> dict[str, Any] | None:
+        """规划器请求前：覆盖默认行为风格，避免 Planner 继续沿用 MaiBot 配置。"""
+        messages = kwargs.get("messages")
+        if not isinstance(messages, list) or not messages:
+            return None
+        persona_bundle = await self._load_persona_bundle()
+        if persona_bundle is None:
+            return None
+        _, styles = persona_bundle
+        behavior_style = str(styles.get("behavior_style") or "").strip()
+        new_messages = deepcopy(messages)
+        replaced = self._replace_planner_behavior_style(new_messages, behavior_style)
+        if not replaced and behavior_style:
+            new_messages[-1:-1] = [{"role": "user", "content": f"【行为风格】\n{behavior_style}"}]
+        self._get_logger().info(
+            f"邻舍桥接：已覆盖 Planner 行为风格 character={self.config.bridge.character_name} "
+            f"system_behavior_replaced={replaced} behavior_style_injected={bool(behavior_style)}"
+        )
+        return {"modified_kwargs": {**kwargs, "messages": new_messages}}
 
     # ===== 记忆与配图：maisaka.reply.before_post_process =====
 
@@ -399,7 +428,7 @@ class NeighborBridgePlugin(MaiBotPlugin):
     async def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         """发起对邻舍桥接接口的请求。"""
         if self._http_client is None:
-            self._http_client = httpx.AsyncClient(timeout=30)
+            self._http_client = httpx.AsyncClient(timeout=HTTP_TIMEOUT_SEC)
         base_url = str(self.config.bridge.base_url or "").rstrip("/")
         parsed = urlparse(path)
         request_url = path if parsed.scheme in {"http", "https"} else f"{base_url}{path}"
@@ -539,6 +568,30 @@ class NeighborBridgePlugin(MaiBotPlugin):
                 entry.setdefault("updated_at", 0.0)
             return entry
 
+    async def _load_persona_bundle(self) -> tuple[str, dict[str, str]] | None:
+        """解析当前角色的人格与风格：本地副本优先，首次拉取邻舍原文后保存。"""
+        if not self.config.plugin.enabled:
+            return None
+        if not str(self.config.bridge.character_name or "").strip():
+            return None
+        character = await self._get_character()
+        if not character:
+            return None
+        character_name = str(character.get("name") or "").strip()
+        if not character_name:
+            return None
+        store_entry = await self._get_or_create_store_entry(character_name)
+        base_prompt = str(store_entry.get("base_prompt") or "").strip()
+        if not base_prompt:
+            base_prompt = str(character.get("base_prompt") or "").strip()
+            if base_prompt:
+                store_entry["base_prompt"] = base_prompt
+                await self._save_persona_store()
+        if not base_prompt:
+            return None
+        styles = await self._resolve_styles(base_prompt, store_entry)
+        return base_prompt, styles
+
     async def _get_latest_memory(self, session_id: str) -> str:
         """获取邻舍最新一份记忆整理（缓存 30 秒），无内容时返回空串。"""
         if not session_id:
@@ -663,6 +716,35 @@ class NeighborBridgePlugin(MaiBotPlugin):
                 message["content"] = base_prompt
                 return
         messages.insert(0, {"role": "system", "content": base_prompt})
+
+    @staticmethod
+    def _replace_planner_behavior_style(messages: list[dict[str, Any]], behavior_style: str) -> bool:
+        """将 Planner system 提示中渲染出的 MaiBot 默认行为风格替换为邻舍行为风格。"""
+        style_text = str(behavior_style or "").strip()
+        for message in messages:
+            if message.get("role") != "system" or not isinstance(message.get("content"), str):
+                continue
+            replaced_content, replaced_count = _BEHAVIOR_STYLE_BLOCK_RE.subn(
+                lambda match: f"{match.group(1)}{style_text}",
+                message["content"],
+                count=1,
+            )
+            if replaced_count:
+                message["content"] = replaced_content
+                return True
+        return False
+
+    @classmethod
+    def _remove_maibot_style_messages(cls, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """移除 MaiBot 自带的表达习惯与一次性回复风格消息，确保邻舍风格唯一生效。"""
+        kept_messages: list[dict[str, Any]] = []
+        for message in messages:
+            if message.get("role") == "user":
+                text = cls._extract_text(message.get("content"))
+                if text.startswith(_EXPRESSION_HABITS_MARKER) or text.startswith(_TEMPORARY_REPLY_STYLE_MARKER):
+                    continue
+            kept_messages.append(message)
+        return kept_messages
 
     # ===== 配图流程 =====
 
