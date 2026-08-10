@@ -2,7 +2,7 @@
   "manifest_version": 2,
   "version": "1.2.4",
   "name": "\u90bb\u820d\u6865\u63a5\u63d2\u4ef6",
-  "description": "\u5c06 MaiBot \u4e0e\u90bb\u820d\u5bf9\u63a5\uff0c\u6ce8\u5165\u90bb\u820d\u89d2\u8272\u4eba\u683c\u3001\u843d\u5e93\u8bb0\u5fc6\u3001\u6309\u9700\u751f\u6210\u914d\u56fe\u5e76\u53d1\u9001",
+  "description": "邻舍，力求借助Anima本地绘图模型搭配LLM，通过日程和朋友圈记录，自动运行一个AI小镇，就好像二次元角色活了一整天。插件给予了角色暂时桥接进入MaiBot的能力，方便切换人格之外，还赋予了自动Anima配图能力",
   "author": {
     "name": "icecranberry",
     "url": "https://github.com/icecranberry/linshe-maibot-adapter"
