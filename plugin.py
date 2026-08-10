@@ -4,7 +4,8 @@
 1. 人格注入：在 Maisaka 回复器构造完模型请求后（maisaka.replyer.before_model_request），
    将 system 人格整条替换为邻舍角色的 base_prompt；在 Planner 请求前
    （maisaka.planner.before_request）覆盖默认行为风格。行为/表达风格由邻舍
-   /api/maibot/derive-style 提炼并以 user 消息注入请求，同时移除 MaiBot 自带表达习惯。
+   /api/maibot/derive-style 提炼并以 user 消息注入请求，同时移除 MaiBot 自带表达习惯，
+   并将请求中的 MaiBot 机器人昵称替换为邻舍角色的 display_name。
 2. 记忆与配图：MaiBot 生成最终回复后（maisaka.reply.before_post_process），将本轮对话交给
    邻舍 /api/maibot/chat 落库记忆并判断是否需要配图；需要配图时轮询 /api/maibot/tasks/:id，
    拿到图片后由 MaiBot 以图片消息发出。
@@ -43,6 +44,8 @@ _BEHAVIOR_STYLE_BLOCK_RE = re.compile(
 )
 _EXPRESSION_HABITS_MARKER = "【表达习惯参考，请视情况自然的使用】"
 _TEMPORARY_REPLY_STYLE_MARKER = "你的说话风格可以尝试："
+_PLANNER_BOT_NAME_RE = re.compile(r"(?m)^([^\n]*?)(?:的行为风格|'s behavior style|の行動スタイル)\s*[:：]")
+_REPLYER_BOT_NAME_RE = re.compile(r"你的名字是([^，。\n]+)")
 
 _MSG_TAG_RE = re.compile(r"^<message\b[^>]*>$")
 _SPEAKER_TAG_RE = re.compile(r'<message\b[^>]*\buser="([^"]*)"')
@@ -67,7 +70,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件（默认开启，无需手动开关）", json_schema_extra={"hidden": True})
-    config_version: str = Field(default="1.2.3", description="配置版本", json_schema_extra={"hidden": True})
+    config_version: str = Field(default="1.2.4", description="配置版本", json_schema_extra={"hidden": True})
 
 
 class BridgeSectionConfig(PluginConfigBase):
@@ -314,12 +317,14 @@ class NeighborBridgePlugin(MaiBotPlugin):
         persona_bundle = await self._load_persona_bundle()
         if persona_bundle is None:
             return None
-        base_prompt, styles = persona_bundle
+        base_prompt, display_name, styles = persona_bundle
 
         new_messages = deepcopy(messages)
         original_message_count = len(new_messages)
         new_messages = self._remove_maibot_style_messages(new_messages)
         removed_maibot_styles = original_message_count - len(new_messages)
+        maibot_nickname = self._extract_maibot_nickname(messages)
+        nickname_replaced = self._replace_maibot_nickname(new_messages, maibot_nickname, display_name)
         self._replace_system_prompt(new_messages, base_prompt)
         injected_styles: list[str] = []
         style_messages: list[dict[str, str]] = []
@@ -344,7 +349,8 @@ class NeighborBridgePlugin(MaiBotPlugin):
         self._get_logger().info(
             f"邻舍桥接：已注入人格 character={self.config.bridge.character_name} "
             f"system_replaced=True styles={injected_styles} "
-            f"maibot_styles_removed={removed_maibot_styles} memory_injected={bool(memory_content)}"
+            f"nickname_replaced={nickname_replaced} maibot_styles_removed={removed_maibot_styles} "
+            f"memory_injected={bool(memory_content)}"
         )
         return {"action": "continue", "modified_kwargs": {"messages": new_messages}}
 
@@ -365,15 +371,18 @@ class NeighborBridgePlugin(MaiBotPlugin):
         persona_bundle = await self._load_persona_bundle()
         if persona_bundle is None:
             return None
-        _, styles = persona_bundle
+        _, display_name, styles = persona_bundle
         behavior_style = str(styles.get("behavior_style") or "").strip()
         new_messages = deepcopy(messages)
+        maibot_nickname = self._extract_maibot_nickname(messages)
+        nickname_replaced = self._replace_maibot_nickname(new_messages, maibot_nickname, display_name)
         replaced = self._replace_planner_behavior_style(new_messages, behavior_style)
         if not replaced and behavior_style:
             new_messages[-1:-1] = [{"role": "user", "content": f"【行为风格】\n{behavior_style}"}]
         self._get_logger().info(
             f"邻舍桥接：已覆盖 Planner 行为风格 character={self.config.bridge.character_name} "
-            f"system_behavior_replaced={replaced} behavior_style_injected={bool(behavior_style)}"
+            f"nickname_replaced={nickname_replaced} system_behavior_replaced={replaced} "
+            f"behavior_style_injected={bool(behavior_style)}"
         )
         return {"modified_kwargs": {**kwargs, "messages": new_messages}}
 
@@ -568,7 +577,7 @@ class NeighborBridgePlugin(MaiBotPlugin):
                 entry.setdefault("updated_at", 0.0)
             return entry
 
-    async def _load_persona_bundle(self) -> tuple[str, dict[str, str]] | None:
+    async def _load_persona_bundle(self) -> tuple[str, str, dict[str, str]] | None:
         """解析当前角色的人格与风格：本地副本优先，首次拉取邻舍原文后保存。"""
         if not self.config.plugin.enabled:
             return None
@@ -580,6 +589,7 @@ class NeighborBridgePlugin(MaiBotPlugin):
         character_name = str(character.get("name") or "").strip()
         if not character_name:
             return None
+        display_name = str(character.get("display_name") or character.get("name") or "").strip()
         store_entry = await self._get_or_create_store_entry(character_name)
         base_prompt = str(store_entry.get("base_prompt") or "").strip()
         if not base_prompt:
@@ -590,7 +600,7 @@ class NeighborBridgePlugin(MaiBotPlugin):
         if not base_prompt:
             return None
         styles = await self._resolve_styles(base_prompt, store_entry)
-        return base_prompt, styles
+        return base_prompt, display_name, styles
 
     async def _get_latest_memory(self, session_id: str) -> str:
         """获取邻舍最新一份记忆整理（缓存 30 秒），无内容时返回空串。"""
@@ -716,6 +726,58 @@ class NeighborBridgePlugin(MaiBotPlugin):
                 message["content"] = base_prompt
                 return
         messages.insert(0, {"role": "system", "content": base_prompt})
+
+    @classmethod
+    def _extract_maibot_nickname(cls, messages: list[dict[str, Any]]) -> str:
+        """从 MaiBot 构造好的 system 提示中反解机器人昵称。"""
+        for message in messages:
+            if message.get("role") != "system":
+                continue
+            content = message.get("content")
+            text = content if isinstance(content, str) else cls._extract_text(content)
+            if not text:
+                continue
+            match = _REPLYER_BOT_NAME_RE.search(text)
+            if match:
+                return match.group(1).strip()
+            match = _PLANNER_BOT_NAME_RE.search(text)
+            if match:
+                return match.group(1).strip()
+        return ""
+
+    @classmethod
+    def _replace_maibot_nickname(cls, messages: list[dict[str, Any]], old_nickname: str, display_name: str) -> int:
+        """将请求消息里的 MaiBot 昵称替换为邻舍 display_name，返回被改写的消息数。"""
+        old_nickname = str(old_nickname or "").strip()
+        display_name = str(display_name or "").strip()
+        if not old_nickname or not display_name or old_nickname == display_name:
+            return 0
+        replaced_count = 0
+        for message in messages:
+            content = message.get("content")
+            new_content = cls._replace_content_nickname(content, old_nickname, display_name)
+            if new_content != content:
+                message["content"] = new_content
+                replaced_count += 1
+        return replaced_count
+
+    @staticmethod
+    def _replace_content_nickname(content: Any, old_nickname: str, display_name: str) -> Any:
+        """替换消息文本中的昵称，保留图片等非文本片段。"""
+        if isinstance(content, str):
+            return content.replace(old_nickname, display_name)
+        if isinstance(content, list):
+            replaced_parts: list[Any] = []
+            for part in content:
+                if isinstance(part, str):
+                    replaced_parts.append(part.replace(old_nickname, display_name))
+                elif isinstance(part, dict) and part.get("type") == "text":
+                    text = str(part.get("text") or "")
+                    replaced_parts.append({**part, "text": text.replace(old_nickname, display_name)})
+                else:
+                    replaced_parts.append(part)
+            return replaced_parts
+        return content
 
     @staticmethod
     def _replace_planner_behavior_style(messages: list[dict[str, Any]], behavior_style: str) -> bool:

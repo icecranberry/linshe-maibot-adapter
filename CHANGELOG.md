@@ -1,5 +1,9 @@
 # 更新日志
 
+## 1.2.4
+
+- 新增：将 MaiBot 请求文本中的机器人昵称替换为邻舍角色的 `display_name`，Planner 与 replyer 均生效。
+
 ## 1.2.3
 
 - 修复：新增 `maisaka.planner.before_request` 注入，Planner 不再沿用 MaiBot 默认行为风格。
