@@ -112,7 +112,7 @@ flowchart LR
 | `persona` | 已无字段（1.2.0 起人格数据全部走本地 `persona_store.json`） |
 | `memory.memory_curation` | 启用对话记忆摘要（关闭时删除已保存摘要） |
 | `image.image_mode` | `auto` 邻舍判断 / `off` 关闭 / `always` 总是配图 |
-| `image.context_max_messages` | 传给邻舍判断的上下文消息条数 |
+| `image.context_max_messages` | 传给邻舍判断/生图的上下文消息条数，默认 2（含用户和 Agent） |
 | `image.poll_interval_sec` / `image.poll_timeout_sec` | 生图轮询间隔 / 超时 |
 
 MaiBot 会在加载/热更新时自动规范化 `config.toml` 并在 `config_back\` 留下时间戳备份；旧版覆盖字段（`persona_base_prompt_override`、`behavior_style_override`、`reply_style_override`）与缓存字段（`style_cache_ttl_sec`、`style_refresh_tick`）已在 1.2.0 移除。

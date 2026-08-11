@@ -128,8 +128,8 @@ class ImageSectionConfig(PluginConfigBase):
         json_schema_extra={"hidden": True},
     )
     context_max_messages: int = Field(
-        default=12,
-        description="传给邻舍判断的上下文消息条数",
+        default=2,
+        description="传给邻舍判断/生图的上下文消息条数（含用户和 Agent）",
         json_schema_extra={"hidden": True},
     )
     poll_interval_sec: float = Field(
@@ -420,7 +420,7 @@ class NeighborBridgePlugin(MaiBotPlugin):
         # 末尾的合成指令消息（如“你想要回复的消息是…”）无真实内容，去掉后再传给邻舍判断
         while context and not context[-1].get("text"):
             context = context[:-1]
-        max_context = max(int(self.config.image.context_max_messages or 12), 1)
+        max_context = max(int(self.config.image.context_max_messages or 2), 1)
         context = context[-max_context:]
 
         client_msg_id = f"{session_id}:{reply_message_id}" if reply_message_id else ""
@@ -697,11 +697,7 @@ class NeighborBridgePlugin(MaiBotPlugin):
                 continue
             if _MSG_TAG_RE.match(line):
                 continue
-            if line.startswith("[图片"):
-                kept.append("[图片]")
-                continue
-            if line == "[表情包]":
-                kept.append("[表情包]")
+            if line.startswith(("[图片", "[表情包", "[表情：")):
                 continue
             if "已折叠的历史工具调用" in line or line.startswith("[工具调用"):
                 in_tool_block = True

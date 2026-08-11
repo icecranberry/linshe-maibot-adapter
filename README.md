@@ -46,7 +46,7 @@
 | `bridge.character_name` | 邻舍角色名，使用 `characters.name`；留空则跳过全部流程 |
 | `memory.memory_curation` | 是否启用对话记忆摘要 |
 | `image.image_mode` | `auto` 由邻舍判断、`off` 关闭、`always` 总是配图 |
-| `image.context_max_messages` | 传给邻舍判断的上下文消息条数 |
+| `image.context_max_messages` | 传给邻舍判断/生图的上下文消息条数，默认 2（含用户和 Agent） |
 | `image.poll_interval_sec` | 生图任务轮询间隔，单位为秒 |
 | `image.poll_timeout_sec` | 生图任务轮询超时，单位为秒 |
 
