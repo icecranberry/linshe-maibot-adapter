@@ -38,12 +38,15 @@ from maibot_sdk.types import ErrorPolicy
 
 CHARACTERS_CACHE_TTL_SEC = 300.0
 HTTP_TIMEOUT_SEC = 120.0
+IMAGE_MIN_SEND_INTERVAL_SEC = 30.0
 
 _BEHAVIOR_STYLE_BLOCK_RE = re.compile(
     r"(?ms)(^[^\n]*?(?:的行为风格|'s behavior style|の行動スタイル)\s*[:：]).*?(?=\n\s*\n)"
 )
 _EXPRESSION_HABITS_MARKER = "【表达习惯参考，请视情况自然的使用】"
 _TEMPORARY_REPLY_STYLE_MARKER = "你的说话风格可以尝试："
+_REPLY_STYLE_LENGTH_LIMIT = "**回复限制在30字内**"
+_BASE_PROMPT_IMAGE_ABILITY_LINE = "## 你拥有画图的能力，只要你想象画面，你就可以发送出来图片"
 _PLANNER_BOT_NAME_RE = re.compile(r"(?m)^([^\n]*?)(?:的行为风格|'s behavior style|の行動スタイル)\s*[:：]")
 _REPLYER_BOT_NAME_RE = re.compile(r"你的名字是([^，。\n]+)")
 
@@ -222,6 +225,7 @@ class NeighborBridgePlugin(MaiBotPlugin):
         self._persona_store_lock = asyncio.Lock()
         self._last_context: dict[str, list[dict[str, str]]] = {}
         self._latest_memory_cache: dict[str, tuple[str, float]] = {}
+        self._last_image_sent_at: dict[str, float] = {}
 
     async def on_load(self) -> None:
         """插件加载：创建 HTTP 客户端并加载本地人格数据。"""
@@ -512,11 +516,15 @@ class NeighborBridgePlugin(MaiBotPlugin):
         try:
             response = await self._request("POST", "/api/maibot/derive-style", json={"base_prompt": base_prompt})
             data = response.json()
-            return {
+            derived = {
                 key: str(data.get(key) or "").strip()
                 for key in ("behavior_style", "reply_style")
                 if str(data.get(key) or "").strip()
             }
+            reply_style = derived.get("reply_style")
+            if reply_style and _REPLY_STYLE_LENGTH_LIMIT not in reply_style:
+                derived["reply_style"] = f"{reply_style.rstrip()}\n{_REPLY_STYLE_LENGTH_LIMIT}"
+            return derived
         except Exception as exc:
             self._get_logger().warning(f"邻舍桥接：提炼行为/表达风格失败: {exc}")
             return {}
@@ -577,6 +585,14 @@ class NeighborBridgePlugin(MaiBotPlugin):
                 entry.setdefault("updated_at", 0.0)
             return entry
 
+    @staticmethod
+    def _ensure_base_prompt_image_ability(base_prompt: str) -> str:
+        """确保 base_prompt 末尾带画图能力说明，避免重复追加。"""
+        base_prompt = str(base_prompt or "").strip()
+        if not base_prompt or _BASE_PROMPT_IMAGE_ABILITY_LINE in base_prompt:
+            return base_prompt
+        return f"{base_prompt}\n{_BASE_PROMPT_IMAGE_ABILITY_LINE}"
+
     async def _load_persona_bundle(self) -> tuple[str, str, dict[str, str]] | None:
         """解析当前角色的人格与风格：本地副本优先，首次拉取邻舍原文后保存。"""
         if not self.config.plugin.enabled:
@@ -600,7 +616,7 @@ class NeighborBridgePlugin(MaiBotPlugin):
         if not base_prompt:
             return None
         styles = await self._resolve_styles(base_prompt, store_entry)
-        return base_prompt, display_name, styles
+        return self._ensure_base_prompt_image_ability(base_prompt), display_name, styles
 
     async def _get_latest_memory(self, session_id: str) -> str:
         """获取邻舍最新一份记忆整理（缓存 30 秒），无内容时返回空串。"""
@@ -806,6 +822,18 @@ class NeighborBridgePlugin(MaiBotPlugin):
 
     # ===== 配图流程 =====
 
+    def _image_send_in_cooldown(self, stream_id: str) -> bool:
+        """按聊天流（群）判断配图发送冷却，冷却期内不进入邻舍判断。"""
+        return time.monotonic() - self._last_image_sent_at.get(stream_id, 0.0) < IMAGE_MIN_SEND_INTERVAL_SEC
+
+    def _try_reserve_image_send(self, stream_id: str) -> bool:
+        """抢占当前聊天流的下一个发送名额，防止并发任务同时发图。"""
+        now = time.monotonic()
+        if now - self._last_image_sent_at.get(stream_id, 0.0) < IMAGE_MIN_SEND_INTERVAL_SEC:
+            return False
+        self._last_image_sent_at[stream_id] = now
+        return True
+
     async def _run_image_flow(
         self,
         stream_id: str,
@@ -816,6 +844,10 @@ class NeighborBridgePlugin(MaiBotPlugin):
         reply_text: str,
     ) -> None:
         """后台任务：保存记忆 + 判断配图 + 轮询取图并发送。"""
+        image_mode = str(self.config.image.image_mode or "auto").strip()
+        if self._image_send_in_cooldown(stream_id):
+            image_mode = "off"
+            self._get_logger().info(f"邻舍桥接：配图冷却中，仅保存记忆并跳过配图判断 stream_id={stream_id}")
         try:
             payload = {
                 "character_name": str(self.config.bridge.character_name or "").strip(),
@@ -825,7 +857,7 @@ class NeighborBridgePlugin(MaiBotPlugin):
                 "context": context,
                 "client_msg_id": client_msg_id,
                 "session_id": stream_id,
-                "image_mode": str(self.config.image.image_mode or "auto").strip(),
+                "image_mode": image_mode,
                 "memory_enabled": bool(self.config.memory.memory_curation),
             }
             response = await self._request("POST", "/api/maibot/chat", json=payload)
@@ -864,10 +896,22 @@ class NeighborBridgePlugin(MaiBotPlugin):
         self._get_logger().warning(f"邻舍桥接：生图任务轮询超时 task_id={task_id}")
 
     async def _download_and_send_image(self, stream_id: str, image_url: str) -> None:
-        """从邻舍拉取图片并 base64 编码后由 MaiBot 发出。"""
-        response = await self._request("GET", image_url)
-        image_base64 = base64.b64encode(response.content).decode("ascii")
-        result = await self.ctx.send.image(image_base64, stream_id)
+        """从邻舍拉取图片并 base64 编码后由 MaiBot 发出（按聊天流限流）。"""
+        previous_last_sent = self._last_image_sent_at.get(stream_id, 0.0)
+        if not self._try_reserve_image_send(stream_id):
+            self._get_logger().info(f"邻舍桥接：配图发送冷却中，跳过发送 stream_id={stream_id}")
+            return
+        try:
+            response = await self._request("GET", image_url)
+            image_base64 = base64.b64encode(response.content).decode("ascii")
+            result = await self.ctx.send.image(image_base64, stream_id)
+        except Exception:
+            self._last_image_sent_at[stream_id] = previous_last_sent
+            raise
+        if result:
+            self._last_image_sent_at[stream_id] = time.monotonic()
+        else:
+            self._last_image_sent_at[stream_id] = previous_last_sent
         self._get_logger().info(f"邻舍桥接：配图已发出 stream_id={stream_id} result={result}")
 
 

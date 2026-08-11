@@ -126,4 +126,4 @@ MaiBot 会在加载/热更新时自动规范化 `config.toml` 并在 `config_bac
 
 ## 9. 版本
 
-当前版本 `1.2.4`，变更记录见 [CHANGELOG.md](./CHANGELOG.md)。1.2.4 新增使用邻舍 `display_name` 覆盖 MaiBot 机器人昵称。
+当前版本 `1.2.5`，变更记录见 [CHANGELOG.md](./CHANGELOG.md)。1.2.5 新增表达风格末尾追加 30 字回复限制、base_prompt 末尾追加画图能力说明，以及按聊天流（群）限制配图发送频率。

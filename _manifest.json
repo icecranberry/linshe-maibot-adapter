@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "version": "1.2.4",
+  "version": "1.2.5",
   "name": "邻舍.EXE桥接适配器————为了ComfyUI自动生成图片这碟醋你想来包顿饺子吗？",
   "description": "邻舍，力求借助Anima本地绘图模型搭配LLM，通过日程和朋友圈记录，自动运行一个AI小镇，就好像二次元角色真的活了一整天。插件给予了角色暂时桥接进入MaiBot的能力，方便切换人格之外，还赋予了自动Anima配图能力",
   "author": {
