@@ -39,6 +39,9 @@ from maibot_sdk.types import ErrorPolicy
 CHARACTERS_CACHE_TTL_SEC = 300.0
 HTTP_TIMEOUT_SEC = 120.0
 IMAGE_MIN_SEND_INTERVAL_SEC = 30.0
+PERSONA_CONTROL_HOST = "127.0.0.1"
+PERSONA_CONTROL_PORT = 3199
+PERSONA_CONTROL_MAX_BODY_BYTES = 1024 * 1024
 
 _BEHAVIOR_STYLE_BLOCK_RE = re.compile(
     r"(?ms)(^[^\n]*?(?:的行为风格|'s behavior style|の行動スタイル)\s*[:：]).*?(?=\n\s*\n)"
@@ -46,6 +49,7 @@ _BEHAVIOR_STYLE_BLOCK_RE = re.compile(
 _EXPRESSION_HABITS_MARKER = "【表达习惯参考，请视情况自然的使用】"
 _TEMPORARY_REPLY_STYLE_MARKER = "你的说话风格可以尝试："
 _REPLY_STYLE_LENGTH_LIMIT = "**回复限制在30字内**"
+_REPLY_STYLE_NO_EMOJI_LIMIT = "**禁止发送Unicode文本类型的emoji**"
 _BASE_PROMPT_IMAGE_ABILITY_LINE = "## 你拥有画图的能力，只要你想象画面，你就可以发送出来图片"
 _PLANNER_BOT_NAME_RE = re.compile(r"(?m)^([^\n]*?)(?:的行为风格|'s behavior style|の行動スタイル)\s*[:：]")
 _REPLYER_BOT_NAME_RE = re.compile(r"你的名字是([^，。\n]+)")
@@ -223,6 +227,7 @@ class NeighborBridgePlugin(MaiBotPlugin):
         self._characters_fetched_at: float = 0.0
         self._persona_store: dict[str, dict[str, Any]] = {}
         self._persona_store_lock = asyncio.Lock()
+        self._persona_control_server: asyncio.Server | None = None
         self._last_context: dict[str, list[dict[str, str]]] = {}
         self._latest_memory_cache: dict[str, tuple[str, float]] = {}
         self._last_image_sent_at: dict[str, float] = {}
@@ -231,10 +236,12 @@ class NeighborBridgePlugin(MaiBotPlugin):
         """插件加载：创建 HTTP 客户端并加载本地人格数据。"""
         self._http_client = httpx.AsyncClient(timeout=HTTP_TIMEOUT_SEC)
         await self._load_persona_store()
+        await self._start_persona_control_server()
         self._get_logger().info("邻舍桥接：插件已加载")
 
     async def on_unload(self) -> None:
         """插件卸载：关闭 HTTP 客户端。"""
+        await self._stop_persona_control_server()
         if self._http_client is not None:
             await self._http_client.aclose()
             self._http_client = None
@@ -260,8 +267,24 @@ class NeighborBridgePlugin(MaiBotPlugin):
 
     @API("persona.get", description="读取邻舍桥接插件的人格数据", version="1", public=True)
     async def get_persona_data(self) -> dict[str, Any]:
-        """返回插件当前内存中的人格数据。"""
+        """返回插件当前内存中的人格数据，并确保 base_prompt 与表达风格带固定追加内容。"""
         async with self._persona_store_lock:
+            changed = False
+            for entry in self._persona_store.values():
+                raw_base_prompt = str(entry.get("base_prompt") or "").strip()
+                ensured_base_prompt = self._ensure_base_prompt_image_ability(raw_base_prompt)
+                if ensured_base_prompt != raw_base_prompt:
+                    entry["base_prompt"] = ensured_base_prompt
+                    entry["updated_at"] = int(time.time() * 1000)
+                    changed = True
+                raw_reply_style = str(entry.get("reply_style") or "").strip()
+                ensured_reply_style = self._ensure_reply_style_length_limit(raw_reply_style)
+                if ensured_reply_style != raw_reply_style:
+                    entry["reply_style"] = ensured_reply_style
+                    entry["updated_at"] = int(time.time() * 1000)
+                    changed = True
+            if changed:
+                self._write_persona_store_unlocked()
             return {"characters": deepcopy(self._persona_store)}
 
     @API("persona.update", description="更新邻舍桥接插件的人格数据", version="1", public=True)
@@ -276,12 +299,157 @@ class NeighborBridgePlugin(MaiBotPlugin):
                 normalized_name,
                 {"base_prompt": "", "behavior_style": "", "reply_style": "", "updated_at": 0.0},
             )
+            changed = False
             for field_name in ("base_prompt", "behavior_style", "reply_style"):
                 if field_name in kwargs:
-                    entry[field_name] = str(kwargs[field_name]).strip()
-            entry["updated_at"] = int(time.time() * 1000)
-            self._write_persona_store_unlocked()
+                    value = str(kwargs[field_name]).strip()
+                    if field_name == "base_prompt":
+                        value = self._ensure_base_prompt_image_ability(value)
+                    elif field_name == "reply_style":
+                        value = self._ensure_reply_style_length_limit(value)
+                    if entry.get(field_name) != value:
+                        entry[field_name] = value
+                        changed = True
+            if changed:
+                entry["updated_at"] = int(time.time() * 1000)
+                self._write_persona_store_unlocked()
             return {"character_name": normalized_name, "entry": deepcopy(entry)}
+
+    async def _start_persona_control_server(self) -> None:
+        """启动仅绑定回环地址、供邻舍管理页使用的人格读写接口。"""
+        try:
+            self._persona_control_server = await asyncio.start_server(
+                self._handle_persona_control_connection,
+                PERSONA_CONTROL_HOST,
+                PERSONA_CONTROL_PORT,
+            )
+            self._get_logger().info(
+                f"邻舍桥接：人格控制接口已启动 http://{PERSONA_CONTROL_HOST}:{PERSONA_CONTROL_PORT}"
+            )
+        except OSError as exc:
+            self._persona_control_server = None
+            self._get_logger().warning(
+                f"邻舍桥接：人格控制接口启动失败 {PERSONA_CONTROL_HOST}:{PERSONA_CONTROL_PORT}: {exc}；"
+                "聊天与配图功能不受影响，管理页人格读写暂不可用"
+            )
+
+    async def _stop_persona_control_server(self) -> None:
+        """停止本机人格读写接口。"""
+        server = self._persona_control_server
+        self._persona_control_server = None
+        if server is None:
+            return
+        server.close()
+        await server.wait_closed()
+
+    async def _handle_persona_control_connection(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        """处理一个最小 HTTP/1.1 请求，不引入额外 Web 框架依赖。"""
+        try:
+            peer = writer.get_extra_info("peername")
+            peer_host = str(peer[0]) if isinstance(peer, tuple) and peer else ""
+            if peer_host not in {"127.0.0.1", "::1"}:
+                await self._write_persona_control_response(writer, 403, {"error": "仅允许本机访问"})
+                return
+
+            try:
+                header_bytes = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5.0)
+            except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, TimeoutError):
+                await self._write_persona_control_response(writer, 400, {"error": "无效的 HTTP 请求"})
+                return
+
+            try:
+                header_text = header_bytes.decode("iso-8859-1")
+                header_lines = header_text.split("\r\n")
+                method, target, _http_version = header_lines[0].split(" ", 2)
+                headers: dict[str, str] = {}
+                for line in header_lines[1:]:
+                    if not line or ":" not in line:
+                        continue
+                    name, value = line.split(":", 1)
+                    headers[name.strip().lower()] = value.strip()
+                content_length = int(headers.get("content-length", "0") or "0")
+            except (ValueError, UnicodeDecodeError):
+                await self._write_persona_control_response(writer, 400, {"error": "无效的 HTTP 请求头"})
+                return
+
+            if content_length < 0 or content_length > PERSONA_CONTROL_MAX_BODY_BYTES:
+                await self._write_persona_control_response(writer, 413, {"error": "请求内容过大"})
+                return
+
+            body = await asyncio.wait_for(reader.readexactly(content_length), timeout=5.0) if content_length else b""
+            path = target.split("?", 1)[0]
+            if method == "GET" and path == "/health":
+                await self._write_persona_control_response(writer, 200, {"ok": True, "service": "linshe-persona"})
+                return
+            if method == "GET" and path == "/persona":
+                result = await self.get_persona_data()
+                await self._write_persona_control_response(writer, 200, {"ok": True, **result})
+                return
+            if method == "PUT" and path == "/persona":
+                try:
+                    payload = json.loads(body.decode("utf-8")) if body else {}
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    await self._write_persona_control_response(writer, 400, {"error": "请求体必须是 JSON"})
+                    return
+                if not isinstance(payload, dict):
+                    await self._write_persona_control_response(writer, 400, {"error": "请求体必须是 JSON 对象"})
+                    return
+                character_name = payload.pop("character_name", "")
+                allowed_fields = {key: payload[key] for key in ("base_prompt", "behavior_style", "reply_style") if key in payload}
+                try:
+                    result = await self.update_persona_data(str(character_name), **allowed_fields)
+                except ValueError as exc:
+                    await self._write_persona_control_response(writer, 400, {"error": str(exc)})
+                    return
+                await self._write_persona_control_response(writer, 200, {"ok": True, **result})
+                return
+
+            await self._write_persona_control_response(writer, 404, {"error": "Not Found"})
+        except (asyncio.IncompleteReadError, ConnectionError, TimeoutError):
+            return
+        except Exception as exc:
+            self._get_logger().warning(f"邻舍桥接：人格控制接口处理请求失败: {exc}")
+            try:
+                await self._write_persona_control_response(writer, 500, {"error": "Internal Server Error"})
+            except Exception:
+                pass
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except (ConnectionError, RuntimeError):
+                pass
+
+    @staticmethod
+    async def _write_persona_control_response(
+        writer: asyncio.StreamWriter,
+        status: int,
+        payload: dict[str, Any],
+    ) -> None:
+        """写出 JSON HTTP 响应。"""
+        reason = {
+            200: "OK",
+            400: "Bad Request",
+            403: "Forbidden",
+            404: "Not Found",
+            413: "Payload Too Large",
+            500: "Internal Server Error",
+        }.get(status, "Error")
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        response_headers = (
+            f"HTTP/1.1 {status} {reason}\r\n"
+            "Content-Type: application/json; charset=utf-8\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Cache-Control: no-store\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ).encode("ascii")
+        writer.write(response_headers + body)
+        await writer.drain()
 
     async def on_config_update(self, scope: str, config_data: dict[str, object], version: str) -> None:
         """配置热更新：清除缓存，使新配置立即生效。"""
@@ -489,7 +657,7 @@ class NeighborBridgePlugin(MaiBotPlugin):
 
         saved_reply_style = str(store_entry.get("reply_style") or "").strip()
         if saved_reply_style:
-            resolved["reply_style"] = saved_reply_style
+            resolved["reply_style"] = self._ensure_reply_style_length_limit(saved_reply_style)
         else:
             derive_keys.append("reply_style")
 
@@ -522,8 +690,8 @@ class NeighborBridgePlugin(MaiBotPlugin):
                 if str(data.get(key) or "").strip()
             }
             reply_style = derived.get("reply_style")
-            if reply_style and _REPLY_STYLE_LENGTH_LIMIT not in reply_style:
-                derived["reply_style"] = f"{reply_style.rstrip()}\n{_REPLY_STYLE_LENGTH_LIMIT}"
+            if reply_style:
+                derived["reply_style"] = self._ensure_reply_style_length_limit(reply_style)
             return derived
         except Exception as exc:
             self._get_logger().warning(f"邻舍桥接：提炼行为/表达风格失败: {exc}")
@@ -593,6 +761,18 @@ class NeighborBridgePlugin(MaiBotPlugin):
             return base_prompt
         return f"{base_prompt}\n{_BASE_PROMPT_IMAGE_ABILITY_LINE}"
 
+    @staticmethod
+    def _ensure_reply_style_length_limit(reply_style: str) -> str:
+        """确保表达风格末尾带回复字数限制与禁止 Unicode 文本 emoji 限制，避免重复追加。"""
+        reply_style = str(reply_style or "").strip()
+        if not reply_style:
+            return reply_style
+        lines = [line for line in reply_style.splitlines() if line.strip()]
+        for limit_line in (_REPLY_STYLE_LENGTH_LIMIT, _REPLY_STYLE_NO_EMOJI_LIMIT):
+            if limit_line not in lines:
+                lines.append(limit_line)
+        return "\n".join(lines)
+
     async def _load_persona_bundle(self) -> tuple[str, str, dict[str, str]] | None:
         """解析当前角色的人格与风格：本地副本优先，首次拉取邻舍原文后保存。"""
         if not self.config.plugin.enabled:
@@ -616,7 +796,12 @@ class NeighborBridgePlugin(MaiBotPlugin):
         if not base_prompt:
             return None
         styles = await self._resolve_styles(base_prompt, store_entry)
-        return self._ensure_base_prompt_image_ability(base_prompt), display_name, styles
+        ensured_base_prompt = self._ensure_base_prompt_image_ability(base_prompt)
+        if ensured_base_prompt != base_prompt:
+            store_entry["base_prompt"] = ensured_base_prompt
+            store_entry["updated_at"] = int(time.time() * 1000)
+            await self._save_persona_store()
+        return ensured_base_prompt, display_name, styles
 
     async def _get_latest_memory(self, session_id: str) -> str:
         """获取邻舍最新一份记忆整理（缓存 30 秒），无内容时返回空串。"""
