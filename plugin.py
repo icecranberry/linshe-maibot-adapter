@@ -188,7 +188,7 @@ class NeighborBridgePlugin(MaiBotPlugin):
             sections.clear()
             sections["plugin"] = {
                 "name": "plugin",
-                "title": "详细参数请到 MaiBot 首页底部“邻舍人格管理”卡片打开的管理页调整",
+                "title": "详细参数请到 MaiBot 首页底部“邻舍人格管理”卡片打开的管理页（http://127.0.0.1:3099/api/maibot/plugin-ui）调整",
                 "description": "启动插件默认激活和邻舍的连接",
                 "icon": "package",
                 "collapsed": False,
