@@ -9,7 +9,7 @@
 | 人格注入 | `before_model_request` / `planner.before_request` | replyer 把 system 人格整条替换为所选角色的 `base_prompt`，Planner 把默认行为风格替换为邻舍风格；「行为风格 / 表达风格」作为请求指令注入，移除 MaiBot 自带表达习惯，并把机器人昵称替换为邻舍 `display_name` |
 | 记忆落库 | `reply_before_post_process`（不阻塞） | 本轮对话交给邻舍 `/api/maibot/chat` 落库长期记忆 + 滚动摘要；可把邻舍整理好的记忆摘要注入主聊天流（每 40 句真实内容一份） |
 | 按需配图 | 同上 | 由邻舍判断是否需要配图，需要时异步生图，插件轮询任务状态，完成后以图片消息发出 |
-| 人格管理页 | WebUI 首页 HomeCard | 跳转到邻舍托管的管理页，查看/编辑注入的 `base_prompt` 与风格 |
+| 人格管理入口 | 插件设置页 Schema | 展示当前激活角色的 `display_name`，并提供邻舍托管管理页入口，查看/编辑注入的 `base_prompt` 与风格 |
 
 所有钩子均以 `ErrorPolicy.SKIP` 挂载：任何一步失败都保持原请求/原回复不变，不影响正常聊天。
 
@@ -26,7 +26,7 @@
 说明：
 
 - 插件目录被 MaiBot 根目录 `.gitignore` 忽略，按规范作为独立插件仓库维护；依赖仅 `maibot_sdk` 与 `httpx`，不引用 MaiBot 内部代码。
-- 管理页放在邻舍工程，是因为它需要读邻舍角色库、调邻舍 LLM 提炼，又要读写 MaiBot 插件配置与本地数据，做成邻舍 3099 端口托管的 HTTP 页面最直接；插件只负责注册一个跳转卡片。
+- 管理页放在邻舍工程，是因为它需要读邻舍角色库、调邻舍 LLM 提炼，又要读写 MaiBot 插件配置与本地数据，做成邻舍 3099 端口托管的 HTTP 页面最直接；插件在设置页提供管理页入口，不再注册首页 HomeCard。
 
 ## 3. 运行时数据流
 
@@ -79,6 +79,7 @@ flowchart LR
 
 ## 5. 人格管理页
 
+- 入口：MaiBot 插件设置页（已移除 WebUI 首页 HomeCard）。
 - 地址：`http://127.0.0.1:3099/api/maibot/plugin-ui`（路由挂在邻舍 `/api/maibot` 前缀下）。
 - 人格信息区直接平铺三个输入框：`base_prompt`、行为风格、表达风格；无本地副本时 `base_prompt` 显示邻舍原文。
 - 操作：`更新人格`（重新拉取邻舍 base_prompt 覆盖本地副本）、`重新提炼风格`、`保存`；切换角色时若缺风格自动提炼。
@@ -108,7 +109,7 @@ flowchart LR
 | `plugin.enabled` | 是否启用 |
 | `plugin.config_version` | 配置版本（当前 `1.2.4`） |
 | `bridge.base_url` | 邻舍服务地址，默认 `http://127.0.0.1:3099` |
-| `bridge.character_name` | 邻舍角色名（`characters.name`）；留空跳过全部流程 |
+| `bridge.character_name` | 邻舍角色显示名（`display_name`，兼容 `characters.name`）；留空则跳过全部流程 |
 | `persona` | 已无字段（1.2.0 起人格数据全部走本地 `persona_store.json`） |
 | `memory.memory_curation` | 启用对话记忆摘要（关闭时删除已保存摘要） |
 | `image.image_mode` | `auto` 邻舍判断 / `off` 关闭 / `always` 总是配图 |

@@ -10,9 +10,9 @@
    邻舍 /api/maibot/chat 落库记忆并判断是否需要配图；需要配图时轮询 /api/maibot/tasks/:id，
    拿到图片后由 MaiBot 以图片消息发出。
 
-3. 人格管理页：在 WebUI 首页注册 HomeCard，跳转到邻舍托管的人格管理页
-   （http://127.0.0.1:3099/api/maibot/plugin-ui），可查看/覆盖注入的 base_prompt、
-   提炼风格、开关记忆整理与配图等参数。
+3. 插件设置页：MaiBot 插件设置页展示当前激活角色的 display_name，并提供邻舍托管
+   的人格管理页入口（http://127.0.0.1:3099/api/maibot/plugin-ui），可查看/覆盖
+   注入的 base_prompt、提炼风格、开关记忆整理与配图等参数。
 
 独立性：仅依赖 maibot_sdk 与 httpx，不引用 MaiBot 内部代码，可独立上传插件仓库。
 """
@@ -22,7 +22,7 @@ from __future__ import annotations
 from copy import deepcopy
 from html import unescape
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 import asyncio
@@ -33,7 +33,7 @@ import time
 
 import httpx
 
-from maibot_sdk import API, Field, HomeCard, HookHandler, MaiBotPlugin, PluginConfigBase
+from maibot_sdk import API, Field, HookHandler, MaiBotPlugin, PluginConfigBase
 from maibot_sdk.types import ErrorPolicy
 
 CHARACTERS_CACHE_TTL_SEC = 300.0
@@ -70,18 +70,22 @@ _INSTRUCTION_START_MARKERS = (
 
 
 class PluginSectionConfig(PluginConfigBase):
-    """插件基础配置。开关与版本信息，详细参数请到 MaiBot 首页「邻舍人格管理」卡片打开的管理页调整。"""
+    """插件默认启用，无需手动开关；详细参数请到管理页调整。"""
 
     __ui_label__ = "插件"
     __ui_icon__ = "package"
     __ui_order__ = 0
 
-    enabled: bool = Field(default=True, description="是否启用插件（默认开启，无需手动开关）", json_schema_extra={"hidden": True})
+    enabled: bool = Field(
+        default=True,
+        description="是否启用插件（默认开启）",
+        json_schema_extra={"hidden": True},
+    )
     config_version: str = Field(default="1.2.4", description="配置版本", json_schema_extra={"hidden": True})
 
 
 class BridgeSectionConfig(PluginConfigBase):
-    """邻舍连接配置。参数已迁移至首页「邻舍人格管理」管理页，请在那里调整。"""
+    """邻舍连接配置。基础连接参数可在插件设置页调整。"""
 
     __ui_label__ = "邻舍连接"
     __ui_icon__ = "cable"
@@ -90,17 +94,17 @@ class BridgeSectionConfig(PluginConfigBase):
     base_url: str = Field(
         default="http://127.0.0.1:3099",
         description="邻舍服务地址",
-        json_schema_extra={"hidden": True},
+        json_schema_extra={"label": "邻舍服务地址", "placeholder": "http://127.0.0.1:3099", "hint": "管理页链接也会跟随该地址"},
     )
     character_name: str = Field(
         default="",
-        description="邻舍角色名（characters.name），留空则跳过全部流程",
-        json_schema_extra={"hidden": True},
+        description="邻舍角色显示名（display_name，兼容 characters.name），留空则跳过全部流程",
+        json_schema_extra={"label": "邻舍角色显示名", "placeholder": "输入 display_name 或 name", "hint": "按邻舍角色 display_name 注入，兼容 characters.name；留空则跳过全部流程"},
     )
 
 
 class PersonaSectionConfig(PluginConfigBase):
-    """人格注入配置。人格替换与风格提炼为始终开启；参数已迁移至首页「邻舍人格管理」管理页，请在那里调整。"""
+    """人格注入配置。人格替换与风格提炼为始终开启，详细参数请到管理页调整。"""
 
     __ui_label__ = "人格注入"
     __ui_icon__ = "user"
@@ -109,7 +113,7 @@ class PersonaSectionConfig(PluginConfigBase):
 
 
 class MemorySectionConfig(PluginConfigBase):
-    """记忆整理配置。开关已迁移至首页「邻舍人格管理」管理页，请在那里调整。"""
+    """记忆整理配置。开关可在插件设置页直接调整。"""
 
     __ui_label__ = "记忆整理"
     __ui_icon__ = "database"
@@ -118,36 +122,39 @@ class MemorySectionConfig(PluginConfigBase):
     memory_curation: bool = Field(
         default=True,
         description="启用对话记忆摘要（同步回邻舍）：每 40 句真实聊天内容整理一份摘要注入 MaiBot 主聊天流；关闭后不再整理，并删除已保存的记忆摘要",
-        json_schema_extra={"hidden": True},
+        json_schema_extra={"label": "启用记忆整理", "hint": "开启后由邻舍整理对话摘要并注入主聊天流；关闭会停止整理并删除已保存摘要"},
     )
 
 
 class ImageSectionConfig(PluginConfigBase):
-    """配图配置。参数已迁移至首页「邻舍人格管理」管理页，请在那里调整。"""
+    """配图配置。基础配图参数可在插件设置页直接调整。"""
 
     __ui_label__ = "配图"
     __ui_icon__ = "image"
     __ui_order__ = 4
 
-    image_mode: str = Field(
+    image_mode: Literal["auto", "off", "always"] = Field(
         default="auto",
         description="auto=由邻舍判断，off=关闭，always=总是配图",
-        json_schema_extra={"hidden": True},
+        json_schema_extra={"label": "配图模式", "hint": "auto=由邻舍判断，off=关闭，always=总是配图"},
     )
     context_max_messages: int = Field(
         default=2,
+        ge=1,
         description="传给邻舍判断/生图的上下文消息条数（含用户和 Agent）",
-        json_schema_extra={"hidden": True},
+        json_schema_extra={"label": "上下文消息条数", "hint": "传给邻舍判断/生图的上下文消息条数（含用户和 Agent）"},
     )
     poll_interval_sec: float = Field(
         default=2.0,
+        ge=0.5,
         description="生图任务轮询间隔（秒）",
-        json_schema_extra={"hidden": True},
+        json_schema_extra={"label": "轮询间隔（秒）", "hint": "生图任务轮询间隔"},
     )
     poll_timeout_sec: float = Field(
         default=180.0,
+        ge=1.0,
         description="生图任务轮询超时（秒）",
-        json_schema_extra={"hidden": True},
+        json_schema_extra={"label": "轮询超时（秒）", "hint": "生图任务轮询超时，需大于轮询间隔"},
     )
 
 
@@ -175,7 +182,7 @@ class NeighborBridgePlugin(MaiBotPlugin):
         plugin_description: str = "",
         plugin_author: str = "",
     ) -> dict[str, Any]:
-        """仅在插件设置页保留基础配置提醒，详细参数统一在首页管理页调整。"""
+        """生成插件设置页 Schema：展示基础配置项，隐藏空配置节，并保留管理页入口提示。"""
         schema = super().get_webui_config_schema(
             plugin_id=plugin_id,
             plugin_name=plugin_name,
@@ -185,39 +192,18 @@ class NeighborBridgePlugin(MaiBotPlugin):
         )
         sections = schema.get("sections")
         if isinstance(sections, dict):
-            sections.clear()
-            sections["plugin"] = {
-                "name": "plugin",
-                "title": "详细参数请到 MaiBot 首页底部“邻舍人格管理”卡片打开的管理页（http://127.0.0.1:3099/api/maibot/plugin-ui）调整",
-                "description": "启动插件默认激活和邻舍的连接",
-                "icon": "package",
-                "collapsed": False,
-                "order": 0,
-                "fields": {},
-            }
+            plugin_section = sections.get("plugin")
+            if isinstance(plugin_section, dict):
+                plugin_section["description"] = (
+                    "插件默认启用，无需手动开关。建议打开邻舍系统设置里的桥接设置卡片设置或者"
+                    "http://127.0.0.1:3099/api/maibot/plugin-ui配置角色、记忆与配图等详细参数。"
+                )
+                plugin_section["fields"] = {}
+            for section_name, section_schema in list(sections.items()):
+                if section_name != "plugin" and isinstance(section_schema, dict) and not section_schema.get("fields"):
+                    sections.pop(section_name)
         schema["layout"] = {"type": "auto", "tabs": []}
         return schema
-
-    def get_components(self) -> list[dict[str, Any]]:
-        """收集组件声明，并让管理页链接跟随 bridge.base_url 配置。"""
-        components = super().get_components()
-        base_url = str(self.config.bridge.base_url or "http://127.0.0.1:3099").strip().rstrip("/")
-        management_url = f"{base_url}/api/maibot/plugin-ui"
-        for component in components:
-            if str(component.get("name") or "") != "persona_manager":
-                continue
-            metadata = component.get("metadata")
-            if isinstance(metadata, dict):
-                content = metadata.get("content")
-                if isinstance(content, list):
-                    for block in content:
-                        if not isinstance(block, dict) or block.get("type") != "actions":
-                            continue
-                        for action in block.get("actions") or []:
-                            if isinstance(action, dict) and str(action.get("label") or "") == "打开人格管理页":
-                                action["url"] = management_url
-            break
-        return components
 
     def __init__(self) -> None:
         """初始化插件状态。"""
@@ -246,25 +232,6 @@ class NeighborBridgePlugin(MaiBotPlugin):
             await self._http_client.aclose()
             self._http_client = None
 
-    @HomeCard(
-        "persona_manager",
-        title="邻舍人格管理",
-        description="查看并管理邻舍桥接注入的人格信息与插件参数",
-        content=[
-            {"type": "stat", "label": "当前激活角色", "value": "未配置"},
-            {
-                "type": "actions",
-                "actions": [{"label": "打开人格管理页", "url": "http://127.0.0.1:3099/api/maibot/plugin-ui"}],
-            },
-        ],
-        runtime_config_path="bridge.character_name",
-        width="medium",
-        order=6,
-    )
-    async def persona_manager_home_card(self) -> None:
-        """首页卡片标记方法（HomeCard 仅用于声明卡片元数据）。"""
-        return None
-
     @API("persona.get", description="读取邻舍桥接插件的人格数据", version="1", public=True)
     async def get_persona_data(self) -> dict[str, Any]:
         """返回插件当前内存中的人格数据，并确保 base_prompt 与表达风格带固定追加内容。"""
@@ -289,15 +256,19 @@ class NeighborBridgePlugin(MaiBotPlugin):
 
     @API("persona.update", description="更新邻舍桥接插件的人格数据", version="1", public=True)
     async def update_persona_data(self, character_name: str = "", **kwargs: Any) -> dict[str, Any]:
-        """合并更新指定角色的人格数据并立即持久化。"""
+        """合并更新指定角色的人格数据并立即持久化，display_name 会归一到 characters.name。"""
         normalized_name = character_name.strip()
         if not normalized_name:
             raise ValueError("character_name 不能为空")
 
+        character = await self._find_character(normalized_name)
+        if character and str(character.get("name") or "").strip():
+            normalized_name = str(character.get("name") or "").strip()
+
         async with self._persona_store_lock:
             entry = self._persona_store.setdefault(
                 normalized_name,
-                {"base_prompt": "", "behavior_style": "", "reply_style": "", "updated_at": 0.0},
+                {"base_prompt": "", "behavior_style": "", "reply_style": "", "display_name": "", "updated_at": 0.0},
             )
             changed = False
             for field_name in ("base_prompt", "behavior_style", "reply_style"):
@@ -632,16 +603,30 @@ class NeighborBridgePlugin(MaiBotPlugin):
         return self._characters
 
     async def _get_character(self) -> dict[str, Any] | None:
-        """按角色名（characters.name）查找邻舍角色。"""
+        """按角色显示名（display_name）查找邻舍角色，兼容 characters.name。"""
         character_name = str(self.config.bridge.character_name or "").strip()
         if not character_name:
             return None
+        character = await self._find_character(character_name)
+        if character is not None:
+            return character
+        characters = self._characters
+        available = "、".join(str(character.get("display_name") or character.get("name") or "") for character in characters)
+        self._get_logger().warning(f"邻舍桥接：未找到角色 {character_name}，可用角色：{available}")
+        return None
+
+    async def _find_character(self, character_name: str) -> dict[str, Any] | None:
+        """按角色显示名或内部名查找邻舍角色。"""
+        normalized_name = str(character_name or "").strip()
+        if not normalized_name:
+            return None
         characters = await self._fetch_characters()
         for character in characters:
-            if str(character.get("name") or "").strip() == character_name:
+            if str(character.get("display_name") or "").strip() == normalized_name:
                 return character
-        available = "、".join(str(character.get("name") or "") for character in characters)
-        self._get_logger().warning(f"邻舍桥接：未找到角色 {character_name}，可用角色：{available}")
+        for character in characters:
+            if str(character.get("name") or "").strip() == normalized_name:
+                return character
         return None
 
     async def _resolve_styles(self, base_prompt: str, store_entry: dict[str, Any]) -> dict[str, str]:
@@ -711,6 +696,7 @@ class NeighborBridgePlugin(MaiBotPlugin):
                                 "base_prompt": str(entry.get("base_prompt") or "").strip(),
                                 "behavior_style": str(entry.get("behavior_style") or "").strip(),
                                 "reply_style": str(entry.get("reply_style") or "").strip(),
+                                "display_name": str(entry.get("display_name") or "").strip(),
                                 "updated_at": float(entry.get("updated_at") or 0.0),
                             }
         except Exception as exc:
@@ -720,6 +706,28 @@ class NeighborBridgePlugin(MaiBotPlugin):
     def _persona_store_path(self) -> Path:
         """返回运行时为当前插件分配的持久化文件路径。"""
         return self.ctx.paths.data_dir / "persona_store.json"
+
+    def _cached_character_display_name(self, character_name: str) -> str:
+        """从本地人格存档读取角色显示名，未命中时返回空串。"""
+        character_name = str(character_name or "").strip()
+        if not character_name:
+            return ""
+        if self._ctx is None:
+            return ""
+        try:
+            if not self._persona_store_path.exists():
+                return ""
+            payload = json.loads(self._persona_store_path.read_text(encoding="utf-8"))
+            characters = payload.get("characters") if isinstance(payload, dict) and isinstance(payload.get("characters"), dict) else {}
+            for stored_name, entry in characters.items():
+                if not isinstance(entry, dict):
+                    continue
+                display_name = str(entry.get("display_name") or "").strip()
+                if stored_name == character_name or display_name == character_name:
+                    return display_name
+        except Exception:
+            return ""
+        return ""
 
     def _write_persona_store_unlocked(self) -> None:
         """在持有人格锁时写入数据文件。"""
@@ -744,12 +752,13 @@ class NeighborBridgePlugin(MaiBotPlugin):
         async with self._persona_store_lock:
             entry = self._persona_store.get(character_name)
             if entry is None:
-                entry = {"base_prompt": "", "behavior_style": "", "reply_style": "", "updated_at": 0.0}
+                entry = {"base_prompt": "", "behavior_style": "", "reply_style": "", "display_name": "", "updated_at": 0.0}
                 self._persona_store[character_name] = entry
             else:
                 entry.setdefault("base_prompt", "")
                 entry.setdefault("behavior_style", "")
                 entry.setdefault("reply_style", "")
+                entry.setdefault("display_name", "")
                 entry.setdefault("updated_at", 0.0)
             return entry
 
@@ -787,6 +796,10 @@ class NeighborBridgePlugin(MaiBotPlugin):
             return None
         display_name = str(character.get("display_name") or character.get("name") or "").strip()
         store_entry = await self._get_or_create_store_entry(character_name)
+        if str(store_entry.get("display_name") or "").strip() != display_name:
+            store_entry["display_name"] = display_name
+            store_entry["updated_at"] = int(time.time() * 1000)
+            await self._save_persona_store()
         base_prompt = str(store_entry.get("base_prompt") or "").strip()
         if not base_prompt:
             base_prompt = str(character.get("base_prompt") or "").strip()
