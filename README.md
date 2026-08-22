@@ -16,7 +16,7 @@
 
 - **人格注入**：使用邻舍角色的 `base_prompt` 替换 MaiBot 请求中的 system 人格，并注入行为风格与表达风格；Planner 请求中的默认行为风格同样会被邻舍行为风格覆盖，MaiBot 自带表达习惯不再保留，请求中的机器人昵称也会替换为邻舍角色的 `display_name`。
 - **记忆同步**：将 MaiBot 的对话回复交给邻舍处理，保存长期记忆和滚动摘要。
-- **按需配图**：由邻舍判断是否需要配图，异步生成后由 MaiBot 发送图片消息。
+- **Planner 主动配图**：MaiBot Planner 调用邻舍生图工具时只提交画面需求，由邻舍按发图助手固定格式提炼生图提示词，异步生成后由 MaiBot 发送图片消息。
 - **人格管理**：插件设置页展示当前激活角色的 `display_name`，并提供邻舍管理页入口，调整角色、人格、记忆和配图参数。
 
 ## 依赖
@@ -25,6 +25,7 @@
 - 已启动邻舍服务，并提供 MaiBot 桥接接口：
   - `GET /api/maibot/characters`
   - `POST /api/maibot/chat`
+  - `POST /api/maibot/generate`
   - `POST /api/maibot/derive-style`
   - `GET /api/maibot/tasks/:id`
   - `GET/PUT /api/maibot/plugin-persona`
@@ -44,11 +45,10 @@
 | `plugin.enabled` | 是否启用插件 |
 | `bridge.base_url` | 邻舍服务地址，默认 `http://127.0.0.1:3099` |
 | `bridge.character_name` | 邻舍角色显示名（`display_name`，兼容 `characters.name`）；留空则跳过全部流程 |
+| `bridge.permanent_config_write` | 永久写入 MaiBot 配置（含机器人昵称）代替临时覆盖，勾选后 MaiBot 单独启动也能使用邻舍人物卡 |
 | `memory.memory_curation` | 是否启用对话记忆摘要 |
-| `image.image_mode` | `auto` 由邻舍判断、`off` 关闭、`always` 总是配图 |
-| `image.context_max_messages` | 传给邻舍判断/生图的上下文消息条数，默认 2（含用户和 Agent） |
-| `image.poll_interval_sec` | 生图任务轮询间隔，单位为秒 |
-| `image.poll_timeout_sec` | 生图任务轮询超时，单位为秒 |
+| `image.poll_interval_sec` | Planner 生图任务轮询间隔，单位为秒 |
+| `image.poll_timeout_sec` | Planner 生图任务轮询超时，单位为秒 |
 
 保存人格信息后，插件会将数据写入 MaiBot SDK 分配的插件数据目录：
 
@@ -62,9 +62,9 @@ data/plugins/github.icecranberry.linshe-bridge/persona_store.json
 用户消息
   -> MaiBot 构造模型请求
   -> 插件注入邻舍角色人格与风格
+  -> Planner 判断需要配图时调用邻舍生图工具（只提交画面需求）
   -> 模型生成回复
-  -> 插件异步同步记忆并判断是否需要配图
-  -> 需要配图时轮询任务并由 MaiBot 发出图片
+  -> 插件异步同步记忆；生图任务完成后由 MaiBot 发出图片
 ```
 
 ## 目录结构

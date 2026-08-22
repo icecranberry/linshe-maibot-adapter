@@ -8,7 +8,7 @@
 | --- | --- | --- |
 | 人格注入 | `before_model_request` / `planner.before_request` | replyer 把 system 人格整条替换为所选角色的 `base_prompt`，Planner 把默认行为风格替换为邻舍风格；「行为风格 / 表达风格」作为请求指令注入，移除 MaiBot 自带表达习惯，并把机器人昵称替换为邻舍 `display_name` |
 | 记忆落库 | `reply_before_post_process`（不阻塞） | 本轮对话交给邻舍 `/api/maibot/chat` 落库长期记忆 + 滚动摘要；可把邻舍整理好的记忆摘要注入主聊天流（每 40 句真实内容一份） |
-| 按需配图 | 同上 | 由邻舍判断是否需要配图，需要时异步生图，插件轮询任务状态，完成后以图片消息发出 |
+| Planner 主动配图 | Planner 工具调用（`linshe_generate_image`） | Planner 只提交画面需求，邻舍 `/api/maibot/generate` 按发图助手固定格式（short_prompt + 外观段）提炼画面需求为 prompt 并应用角色 LoRA 后起异步生图任务，插件轮询任务状态，完成后以图片消息发出 |
 | 人格管理入口 | 插件设置页 Schema | 展示当前激活角色的 `display_name`，并提供邻舍托管管理页入口，查看/编辑注入的 `base_prompt` 与风格 |
 
 所有钩子均以 `ErrorPolicy.SKIP` 挂载：任何一步失败都保持原请求/原回复不变，不影响正常聊天。
@@ -35,12 +35,11 @@ flowchart LR
     U[用户消息] --> M[Maisaka 构造请求]
     M -->|planner.before_request / before_model_request| P[插件: 替换默认人格/行为风格 + 注入风格]
     P --> L[LLM 生成回复]
-    L -->|reply_before_post_process 不阻塞| B[插件异步调邻舍 /chat]
+    L -->|reply_before_post_process 不阻塞| B[插件异步调邻舍 /chat 同步记忆]
     B --> D[(邻舍数据库: 记忆/会话)]
-    B --> J{邻舍判断需要配图?}
-    J -- 是 --> T[邻舍异步生图任务]
+    P2[Planner 判断需要配图] -->|linshe_generate_image 工具| G[邻舍 /generate 起异步生图任务]
+    G --> T[邻舍异步生图任务]
     T -->|插件轮询 /tasks/:id| I[拉取图片并发送]
-    J -- 否 --> E[结束]
 ```
 
 人格与风格数据不写入邻舍数据库，统一落在插件本地 `persona_store.json`。
@@ -94,7 +93,9 @@ flowchart LR
 | POST | `/api/maibot/derive-style` | 从 `base_prompt` 提炼行为/表达风格（纯预览，由调用方保存） |
 | GET | `/api/maibot/plugin-persona` | 读取本地人格数据（按角色） |
 | PUT | `/api/maibot/plugin-persona` | 合并写入本地人格数据（按角色，未传字段不覆盖） |
-| POST | `/api/maibot/chat` | 存记忆 + 判断配图 + 起生图任务（插件主入口） |
+| POST | `/api/maibot/chat` | 存记忆 + 判断配图 + 起生图任务（保留兼容） |
+| POST | `/api/maibot/generate` | 供 Planner 生图工具提交画面需求，经固定格式提炼 prompt 后起异步生图任务（不落记忆、不做配图判断） |
+| POST | `/api/maibot/permanent-persona` | 把人格/行为风格/表达风格/机器人昵称永久写入 MaiBot `bot_config.toml` |
 | GET | `/api/maibot/tasks/:id` | 生图任务状态（插件轮询） |
 | GET | `/api/maibot/latest-memory` | 最新一份记忆整理（插件注入主聊天流） |
 | DELETE | `/api/maibot/latest-memory` | 删除记忆摘要（带 `session_id` 删单个，否则删全部） |
@@ -110,11 +111,10 @@ flowchart LR
 | `plugin.config_version` | 配置版本（当前 `1.2.4`） |
 | `bridge.base_url` | 邻舍服务地址，默认 `http://127.0.0.1:3099` |
 | `bridge.character_name` | 邻舍角色显示名（`display_name`，兼容 `characters.name`）；留空则跳过全部流程 |
+| `bridge.permanent_config_write` | 永久写入 MaiBot 配置（含机器人昵称）代替临时覆盖，勾选后 MaiBot 单独启动也能使用邻舍人物卡 |
 | `persona` | 已无字段（1.2.0 起人格数据全部走本地 `persona_store.json`） |
 | `memory.memory_curation` | 启用对话记忆摘要（关闭时删除已保存摘要） |
-| `image.image_mode` | `auto` 邻舍判断 / `off` 关闭 / `always` 总是配图 |
-| `image.context_max_messages` | 传给邻舍判断/生图的上下文消息条数，默认 2（含用户和 Agent） |
-| `image.poll_interval_sec` / `image.poll_timeout_sec` | 生图轮询间隔 / 超时 |
+| `image.poll_interval_sec` / `image.poll_timeout_sec` | Planner 生图任务轮询间隔 / 超时 |
 
 MaiBot 会在加载/热更新时自动规范化 `config.toml` 并在 `config_back\` 留下时间戳备份；旧版覆盖字段（`persona_base_prompt_override`、`behavior_style_override`、`reply_style_override`）与缓存字段（`style_cache_ttl_sec`、`style_refresh_tick`）已在 1.2.0 移除。
 
@@ -127,4 +127,4 @@ MaiBot 会在加载/热更新时自动规范化 `config.toml` 并在 `config_bac
 
 ## 9. 版本
 
-当前版本 `1.2.5`，变更记录见 [CHANGELOG.md](./CHANGELOG.md)。1.2.5 新增表达风格末尾追加 30 字回复限制、base_prompt 末尾追加画图能力说明，以及按聊天流（群）限制配图发送频率。
+当前版本 `1.3.0`，变更记录见 [CHANGELOG.md](./CHANGELOG.md)。1.3.0 将配图改为 MaiBot Planner 主动调用邻舍生图工具，生图工具说明在桥接注入时临时追加到行为风格，并支持永久写入 MaiBot 配置（含机器人昵称），原 `/chat` 等接口保留兼容。
