@@ -38,7 +38,6 @@ from maibot_sdk.types import ErrorPolicy, ToolParameterInfo, ToolParamType
 
 CHARACTERS_CACHE_TTL_SEC = 300.0
 HTTP_TIMEOUT_SEC = 120.0
-IMAGE_MIN_SEND_INTERVAL_SEC = 30.0
 PERSONA_CONTROL_HOST = "127.0.0.1"
 PERSONA_CONTROL_PORT = 3199
 PERSONA_CONTROL_MAX_BODY_BYTES = 1024 * 1024
@@ -52,9 +51,12 @@ _REPLY_STYLE_LENGTH_LIMIT = "**回复限制在30字内**"
 _REPLY_STYLE_NO_EMOJI_LIMIT = "**禁止发送Unicode文本类型的emoji**"
 _LEGACY_BASE_PROMPT_IMAGE_ABILITY_LINE = "## 你拥有画图的能力，只要你想象画面，你就可以发送出来图片"
 _BEHAVIOR_STYLE_IMAGE_TOOL_LINE = (
-    "你可以调用生图工具 linshe_generate_image 生成图片：调用时只需描述想要的画面需求，"
-    "不要直接编写生图提示词。不限于用户明确要求画图时才使用；像正常群聊一样，"
-    "有时候回复或开场白配图能让内容更丰富。调用后直接正常回复文字，不要引用图片媒体。"
+    "画图是你日常表达的一部分，随时可以主动调用生图工具 linshe_generate_image 发一张图："
+    "调用时只需用一两句话描述想要的画面需求，不要直接编写生图提示词。"
+    "不要等用户开口要图——打招呼、分享日常、说到自己正在做的事、"
+    "聊到具体的场景/动作/物品/食物/天气、情绪上头或想玩梗吐槽时，"
+    "只要配一张图能让表达更生动，就直接画出来随回复一起发。"
+    "调用后直接正常回复文字，不要引用图片媒体。"
 )
 _PLANNER_BOT_NAME_RE = re.compile(r"(?m)^([^\n]*?)(?:的行为风格|'s behavior style|の行動スタイル)\s*[:：]")
 _REPLYER_BOT_NAME_RE = re.compile(r"你的名字是([^，。\n]+)")
@@ -86,7 +88,7 @@ class PluginSectionConfig(PluginConfigBase):
         description="是否启用插件（默认开启）",
         json_schema_extra={"hidden": True},
     )
-    config_version: str = Field(default="1.3.0", description="配置版本", json_schema_extra={"hidden": True})
+    config_version: str = Field(default="1.3.1", description="配置版本", json_schema_extra={"hidden": True})
 
 
 class BridgeSectionConfig(PluginConfigBase):
@@ -218,10 +220,9 @@ class NeighborBridgePlugin(MaiBotPlugin):
         self._persona_control_server: asyncio.Server | None = None
         self._last_context: dict[str, list[dict[str, str]]] = {}
         self._latest_memory_cache: dict[str, tuple[str, float]] = {}
-        self._last_image_sent_at: dict[str, float] = {}
         self._permanent_persona_hash: str | None = None
         self._pending_image_streams: set[str] = set()
-        self._image_trigger_user_text: dict[str, str] = {}
+        self._last_image_requirement: dict[str, str] = {}
 
     async def on_load(self) -> None:
         """插件加载：创建 HTTP 客户端并加载本地人格数据。"""
@@ -558,14 +559,18 @@ class NeighborBridgePlugin(MaiBotPlugin):
 
     @Tool(
         "linshe_generate_image",
-        brief_description="调用邻舍直接生成一张图片，并异步发送到当前聊天流",
+        brief_description="主动生成一张贴合当前对话的图片，并异步发送到当前聊天流",
         detailed_description=(
-            "当对话需要配图、用户要求画图、或当前场景适合用图片加强表达时使用。"
+            "在合适的时机主动使用：用户明确要求画图时必须调用；此外在打招呼、分享日常、"
+            "说到自己正在做的事、聊到具体的场景/动作/物品/食物/天气、情绪上头或玩梗吐槽时，"
+            "只要配一张图能让表达更生动，就不要等用户开口，直接调用本工具画一张。"
             "参数说明：\n"
-            "- requirement：string，必填。画面需求描述，只说明想要一张什么样的图片，不需要写生图提示词。如果画面里面需要有“我”，那就直接在需求中注明名字即可（例如：芙宁娜正在喝茶。），除非特意强调“我”的衣服，不然不需要描述外观，只需要注明名字即可。"
+            "- requirement：string，必填。画面需求描述，用一两句话说明想要一张什么样的图片，不需要写生图提示词。"
+            "如果画面里面需要有“我”，那就直接在需求中注明名字即可（例如：芙宁娜正在喝茶。），"
+            "除非特意强调“我”的衣服，不然不需要描述外观，只需要注明名字即可。\n"
             "调用后图片会异步生成并自动发送，工具结果不包含可引用的图片媒体。"
-            "不要使用 reply/send_image 的 media_index 或 msg_id 引用本工具结果，"
-            "直接正常回复文字即可；同一聊天流已有生图任务时不要再调用本工具。"
+            "不要使用 reply/send_image 的 media_index 或 msg_id 引用本工具结果，直接正常回复文字即可；"
+            "当前聊天流已有生图任务在生成中时不要调用，同一张画面不要重复生成。"
         ),
         parameters=[
             ToolParameterInfo(
@@ -592,20 +597,11 @@ class NeighborBridgePlugin(MaiBotPlugin):
             return {"success": False, "error": "画面需求不能为空。"}
         if len(image_requirement) > 2000:
             return {"success": False, "error": "画面需求过长（最多 2000 字）。"}
-        context = self._last_context.get(stream_id) or []
-        latest_user = ""
-        for entry in reversed(context):
-            if entry.get("role") == "user" and str(entry.get("text") or "").strip():
-                latest_user = str(entry.get("text") or "").strip()
-                break
-        if latest_user and self._image_trigger_user_text.get(stream_id, "") == latest_user:
-            return {"success": False, "error": "本轮对话已经触发过邻舍生图，请等图片发出或收到新消息后再继续。"}
+        if image_requirement == self._last_image_requirement.get(stream_id, ""):
+            return {"success": False, "error": "同样的画面需求刚刚已经生成过，请换一个画面或等用户发来新消息。"}
         if stream_id in self._pending_image_streams:
             return {"success": False, "error": "当前聊天流已有生图任务进行中，请等图片发出后再继续。"}
-        if self._image_send_in_cooldown(stream_id):
-            return {"success": False, "error": "当前聊天流配图发送冷却中，请稍后再试。"}
-        context = self._last_context.get(stream_id) or []
-        context = context[-6:]
+        context = (self._last_context.get(stream_id) or [])[-6:]
         try:
             response = await self._request(
                 "POST",
@@ -625,9 +621,7 @@ class NeighborBridgePlugin(MaiBotPlugin):
             self._get_logger().warning(f"邻舍桥接：Planner 生图工具触发失败: {exc}")
             return {"success": False, "error": f"触发邻舍生图失败: {exc}"}
 
-        self._last_image_sent_at[stream_id] = time.monotonic()
-        if latest_user:
-            self._image_trigger_user_text[stream_id] = latest_user
+        self._last_image_requirement[stream_id] = image_requirement
         self._pending_image_streams.add(stream_id)
         asyncio.create_task(self._run_pending_image_task(stream_id, task_id))
         return {
@@ -1165,10 +1159,6 @@ class NeighborBridgePlugin(MaiBotPlugin):
 
     # ===== 生图流程 =====
 
-    def _image_send_in_cooldown(self, stream_id: str) -> bool:
-        """按聊天流（群）判断生图发送冷却，冷却期内拒绝新的生图工具调用。"""
-        return time.monotonic() - self._last_image_sent_at.get(stream_id, 0.0) < IMAGE_MIN_SEND_INTERVAL_SEC
-
     async def _run_memory_sync(
         self,
         stream_id: str,
@@ -1228,19 +1218,10 @@ class NeighborBridgePlugin(MaiBotPlugin):
         self._get_logger().warning(f"邻舍桥接：生图任务轮询超时 task_id={task_id}")
 
     async def _download_and_send_image(self, stream_id: str, image_url: str) -> None:
-        """从邻舍拉取图片并 base64 编码后由 MaiBot 发出（发送名额已由工具触发时占用）。"""
-        previous_last_sent = self._last_image_sent_at.get(stream_id, 0.0)
-        try:
-            response = await self._request("GET", image_url)
-            image_base64 = base64.b64encode(response.content).decode("ascii")
-            result = await self.ctx.send.image(image_base64, stream_id)
-        except Exception:
-            self._last_image_sent_at[stream_id] = previous_last_sent
-            raise
-        if result:
-            self._last_image_sent_at[stream_id] = time.monotonic()
-        else:
-            self._last_image_sent_at[stream_id] = previous_last_sent
+        """从邻舍拉取图片并 base64 编码后由 MaiBot 发出。"""
+        response = await self._request("GET", image_url)
+        image_base64 = base64.b64encode(response.content).decode("ascii")
+        result = await self.ctx.send.image(image_base64, stream_id)
         self._get_logger().info(f"邻舍桥接：配图已发出 stream_id={stream_id} result={result}")
 
 
