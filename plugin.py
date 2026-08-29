@@ -47,8 +47,6 @@ _BEHAVIOR_STYLE_BLOCK_RE = re.compile(
 )
 _EXPRESSION_HABITS_MARKER = "【表达习惯参考，请视情况自然的使用】"
 _TEMPORARY_REPLY_STYLE_MARKER = "你的说话风格可以尝试："
-_REPLY_STYLE_LENGTH_LIMIT = "**回复限制在30字内**"
-_REPLY_STYLE_NO_EMOJI_LIMIT = "**禁止发送Unicode文本类型的emoji**"
 _LEGACY_BASE_PROMPT_IMAGE_ABILITY_LINE = "## 你拥有画图的能力，只要你想象画面，你就可以发送出来图片"
 _BEHAVIOR_STYLE_IMAGE_TOOL_LINE = (
     "画图是你日常表达的一部分，随时可以主动调用生图工具 linshe_generate_image 发一张图："
@@ -245,7 +243,7 @@ class NeighborBridgePlugin(MaiBotPlugin):
 
     @API("persona.get", description="读取邻舍桥接插件的人格数据", version="1", public=True)
     async def get_persona_data(self) -> dict[str, Any]:
-        """返回插件当前内存中的人格数据，并确保表达风格带固定追加内容，清理旧版 base_prompt 追加。"""
+        """返回插件当前内存中的人格数据，并清理旧版 base_prompt 追加。"""
         async with self._persona_store_lock:
             changed = False
             for entry in self._persona_store.values():
@@ -253,13 +251,6 @@ class NeighborBridgePlugin(MaiBotPlugin):
                 stripped_base_prompt = self._strip_legacy_base_prompt_image_ability(raw_base_prompt)
                 if stripped_base_prompt != raw_base_prompt:
                     entry["base_prompt"] = stripped_base_prompt
-                    entry["updated_at"] = int(time.time() * 1000)
-                    changed = True
-
-                raw_reply_style = str(entry.get("reply_style") or "").strip()
-                ensured_reply_style = self._ensure_reply_style_length_limit(raw_reply_style)
-                if ensured_reply_style != raw_reply_style:
-                    entry["reply_style"] = ensured_reply_style
                     entry["updated_at"] = int(time.time() * 1000)
                     changed = True
             if changed:
@@ -288,8 +279,6 @@ class NeighborBridgePlugin(MaiBotPlugin):
                     value = str(kwargs[field_name]).strip()
                     if field_name == "base_prompt":
                         value = self._strip_legacy_base_prompt_image_ability(value)
-                    elif field_name == "reply_style":
-                        value = self._ensure_reply_style_length_limit(value)
                     if entry.get(field_name) != value:
                         entry[field_name] = value
                         changed = True
@@ -738,7 +727,7 @@ class NeighborBridgePlugin(MaiBotPlugin):
 
         saved_reply_style = str(store_entry.get("reply_style") or "").strip()
         if saved_reply_style:
-            resolved["reply_style"] = self._ensure_reply_style_length_limit(saved_reply_style)
+            resolved["reply_style"] = saved_reply_style
         else:
             derive_keys.append("reply_style")
 
@@ -750,8 +739,6 @@ class NeighborBridgePlugin(MaiBotPlugin):
         for key in derive_keys:
             if derived.get(key):
                 value = derived[key]
-                if key == "reply_style":
-                    value = self._ensure_reply_style_length_limit(value)
                 resolved[key] = value
                 store_entry[key] = value
                 changed = True
@@ -773,9 +760,6 @@ class NeighborBridgePlugin(MaiBotPlugin):
                 for key in ("behavior_style", "reply_style")
                 if str(data.get(key) or "").strip()
             }
-            reply_style = derived.get("reply_style")
-            if reply_style:
-                derived["reply_style"] = self._ensure_reply_style_length_limit(reply_style)
             return derived
         except Exception as exc:
             self._get_logger().warning(f"邻舍桥接：提炼行为/表达风格失败: {exc}")
@@ -912,18 +896,6 @@ class NeighborBridgePlugin(MaiBotPlugin):
             self._get_logger().info(f"邻舍桥接：已永久写入 MaiBot 配置 character={payload['display_name'] or payload['base_prompt'][:20]}")
         except Exception as exc:
             self._get_logger().warning(f"邻舍桥接：永久写入 MaiBot 配置失败: {exc}")
-
-    @staticmethod
-    def _ensure_reply_style_length_limit(reply_style: str) -> str:
-        """确保表达风格末尾带回复字数限制与禁止 Unicode 文本 emoji 限制，避免重复追加。"""
-        reply_style = str(reply_style or "").strip()
-        if not reply_style:
-            return reply_style
-        lines = [line for line in reply_style.splitlines() if line.strip()]
-        for limit_line in (_REPLY_STYLE_LENGTH_LIMIT, _REPLY_STYLE_NO_EMOJI_LIMIT):
-            if limit_line not in lines:
-                lines.append(limit_line)
-        return "\n".join(lines)
 
     async def _load_persona_bundle(self) -> tuple[str, str, dict[str, str]] | None:
         """解析当前角色的人格与风格：本地副本优先，首次拉取邻舍原文后保存。"""
