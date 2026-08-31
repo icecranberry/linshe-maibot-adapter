@@ -606,6 +606,15 @@ class NeighborBridgePlugin(MaiBotPlugin):
             task_id = data.get("task_id")
             if not task_id:
                 return {"success": False, "error": "邻舍未返回生图任务 ID。"}
+        except httpx.HTTPStatusError as exc:
+            error_message = self._describe_http_error(exc)
+            if exc.response.status_code == 404:
+                error_message += (
+                    f"。当前配置的角色为「{character_name}」，角色可能已被删除，"
+                    "或插件设置中的「邻舍角色显示名」与邻舍角色库不一致"
+                )
+            self._get_logger().warning(f"邻舍桥接：Planner 生图工具触发失败: {error_message}")
+            return {"success": False, "error": f"触发邻舍生图失败：{error_message}。"}
         except Exception as exc:
             self._get_logger().warning(f"邻舍桥接：Planner 生图工具触发失败: {exc}")
             return {"success": False, "error": f"触发邻舍生图失败: {exc}"}
@@ -661,6 +670,28 @@ class NeighborBridgePlugin(MaiBotPlugin):
         return None
 
     # ===== 邻舍接口调用 =====
+
+    @staticmethod
+    def _describe_http_error(exc: httpx.HTTPStatusError) -> str:
+        """整理邻舍接口的非 2xx 响应，优先把 JSON 中的 error/hint 转成中文描述。"""
+        status = exc.response.status_code
+        try:
+            payload = exc.response.json()
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            error_text = str(payload.get("error") or "").strip()
+            hint = str(payload.get("hint") or "").strip()
+            description = {
+                "character not found": "邻舍角色库中未找到该角色",
+            }.get(error_text, error_text or "邻舍接口返回错误")
+            if hint:
+                description = f"{description}（服务端提示：{hint}）"
+            return f"邻舍接口返回 HTTP {status}：{description}"
+        detail = exc.response.text.strip()[:200]
+        if detail:
+            return f"邻舍接口返回 HTTP {status}：{detail}"
+        return f"邻舍接口返回 HTTP {status}"
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         """发起对邻舍桥接接口的请求。"""
